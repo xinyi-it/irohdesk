@@ -227,14 +227,19 @@ async fn handle_iroh_connection(
     conn: Connection,
     remote_node_id: String,
 ) -> ResultType<()> {
-    // Accept the bidirectional QUIC stream opened by the client
+    // Open a bidirectional QUIC stream. The server speaks first in the
+    // RustDesk handshake (sends SignedId), so the server must open the
+    // stream — this forces the QUIC STREAM frame to be sent immediately,
+    // carrying the SignedId bytes to the peer. If the client opens the
+    // stream without writing, the empty STREAM frame can stall through
+    // relays, deadlocking accept_bi() on the server side.
     let (send_stream, recv_stream) = conn
-        .accept_bi()
+        .open_bi()
         .await
-        .map_err(|e| anyhow::anyhow!("failed to accept QUIC bi-stream: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to open QUIC bi-stream: {}", e))?;
 
     log::info!(
-        "Accepted QUIC bi-stream from {}, starting RustDesk protocol",
+        "Opened QUIC bi-stream to {}, starting RustDesk protocol",
         remote_node_id
     );
 
@@ -534,11 +539,14 @@ pub async fn iroh_connect_and_handshake(
     let conn = connect(peer_node_id).await?;
     log::info!("Iroh connection established");
 
-    // 2. Open bi-stream
+    // 2. Accept the bi-stream opened by the server. The server opens the
+    // stream because it speaks first (sends SignedId); accepting here
+    // avoids the empty-STREAM-frame stall that happens when the client
+    // opens a stream without writing.
     let (mut send_stream, mut recv_stream) = conn
-        .open_bi()
+        .accept_bi()
         .await
-        .map_err(|e| anyhow::anyhow!("failed to open QUIC bi-stream: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to accept QUIC bi-stream: {}", e))?;
 
     // Get remote NodeId for verification
     let remote_node_id = conn
