@@ -689,6 +689,10 @@ pub async fn iroh_connect_and_handshake(
 
     // 5. Read server responses
     log::info!("Waiting for server response...");
+    let mut logged_in = false;
+    let mut frame_count: u64 = 0;
+    let mut audio_count: u64 = 0;
+    let mut last_stats = std::time::Instant::now();
     loop {
         match hbb_common::timeout(30_000, stream.next()).await {
             Ok(Some(Ok(bytes))) => {
@@ -696,15 +700,17 @@ pub async fn iroh_connect_and_handshake(
                     match msg.union {
                         Some(hbb_common::message_proto::message::Union::LoginResponse(lr)) => {
                             if lr.error().is_empty() {
+                                logged_in = true;
                                 log::info!("Login successful! Connected to desktop.");
                                 log::info!("  Platform: {}", lr.peer_info().platform);
+                                log::info!("Streaming... press Ctrl+C to disconnect.");
                             } else {
                                 log::error!("Login failed: {}", lr.error());
                                 return Err(anyhow::anyhow!("Login failed: {}", lr.error()));
                             }
                         }
                         Some(hbb_common::message_proto::message::Union::VideoFrame(_)) => {
-                            log::info!("Received video frame (desktop streaming active)");
+                            frame_count += 1;
                         }
                         Some(hbb_common::message_proto::message::Union::CursorData(_)) => {
                             // Cursor data — silently handle
@@ -713,7 +719,7 @@ pub async fn iroh_connect_and_handshake(
                             // Clipboard data
                         }
                         Some(hbb_common::message_proto::message::Union::AudioFrame(_)) => {
-                            log::info!("Received audio frame");
+                            audio_count += 1;
                         }
                         Some(other) => {
                             log::debug!("Received message: {:?}", std::mem::discriminant(&other));
@@ -722,6 +728,15 @@ pub async fn iroh_connect_and_handshake(
                             log::debug!("Received empty message");
                         }
                     }
+                }
+                // Periodic stats so the user can see the connection is alive and
+                // whether frames are actually flowing. Every 5s.
+                if logged_in && last_stats.elapsed() >= std::time::Duration::from_secs(5) {
+                    log::info!(
+                        "streaming: video frames={}, audio frames={}",
+                        frame_count, audio_count
+                    );
+                    last_stats = std::time::Instant::now();
                 }
             }
             Ok(Some(Err(e))) => {
@@ -733,8 +748,13 @@ pub async fn iroh_connect_and_handshake(
                 break;
             }
             Err(_) => {
-                log::info!("Read timeout (30s no data), connection may be idle");
-                break;
+                // Timeout without data. Do NOT break — keep waiting so the
+                // connection stays up. Only warn (less noisily after the first).
+                if logged_in {
+                    log::warn!("no data in 30s (video frames so far: {})", frame_count);
+                } else {
+                    log::info!("Waiting for server response...");
+                }
             }
         }
     }
