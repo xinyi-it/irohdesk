@@ -631,9 +631,51 @@ pub async fn iroh_connect_and_handshake(
     let my_name = crate::username();
     let my_platform = hbb_common::whoami::platform().to_string();
 
+    // The server sends a Hash { salt, challenge } message right after the key
+    // exchange (on_open). We must hash the password with salt → h1, then h1 with
+    // challenge → h2, and send h2 as lr.password — the server never sees plaintext.
+    // If we don't receive a Hash in time (e.g. older server), fall back to plaintext
+    // so the connection still has a chance instead of hanging.
+    let password_field: bytes::Bytes = {
+        let pw_bytes = password.as_bytes().to_vec();
+        match hbb_common::timeout(10_000, stream.next()).await {
+            Ok(Some(Ok(b))) => {
+                match hbb_common::protos::message::Message::parse_from_bytes(&b) {
+                    Ok(msg) if matches!(msg.union, Some(hbb_common::message_proto::message::Union::Hash(_))) => {
+                        if let Some(hbb_common::message_proto::message::Union::Hash(hash)) = msg.union {
+                            use sha2::{Digest, Sha256};
+                            let mut h1 = Sha256::new();
+                            h1.update(&pw_bytes);
+                            h1.update(hash.salt.as_bytes());
+                            let h1 = h1.finalize();
+                            let mut h2 = Sha256::new();
+                            h2.update(&h1);
+                            h2.update(hash.challenge.as_bytes());
+                            h2.finalize().to_vec().into()
+                        } else {
+                            pw_bytes.into()
+                        }
+                    }
+                    Ok(_) => {
+                        log::warn!("Expected Hash message before login, got something else; sending plaintext password");
+                        pw_bytes.into()
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to parse pre-login message: {}; sending plaintext password", e);
+                        pw_bytes.into()
+                    }
+                }
+            }
+            _ => {
+                log::warn!("No Hash message received before login (timeout/closed); sending plaintext password");
+                pw_bytes.into()
+            }
+        }
+    };
+
     let mut lr = hbb_common::protos::message::LoginRequest::new();
     lr.username = peer_node_id.to_owned(); // Use peer's NodeId as the "ID" for login
-    lr.password = password.as_bytes().to_vec().into();
+    lr.password = password_field;
     lr.my_id = my_id;
     lr.my_name = my_name;
     lr.my_platform = my_platform;
