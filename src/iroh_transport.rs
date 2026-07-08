@@ -168,6 +168,7 @@ pub async fn get_or_create_endpoint() -> ResultType<Arc<IrohEndpoint>> {
                 }
             };
             rt.block_on(async move {
+                log::info!("iroh-endpoint thread started (multi-thread runtime, 2 workers)");
                 let ep = IrohEndpoint::new().await;
                 let _ = tx.send(ep);
                 // Keep the runtime alive forever — the endpoint's background
