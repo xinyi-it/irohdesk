@@ -373,6 +373,10 @@ fn encode_frame(data: &[u8]) -> bytes::Bytes {
     let mut buf = BytesMut::with_capacity(4 + data.len());
     buf.put_u32(data.len() as u32);
     buf.extend_from_slice(data);
+    log::info!("encode_frame: payload size = {}, total frame size = {}", data.len(), 4 + data.len());
+    if data.len() > 0 && data.len() < 200 {
+        log::info!("encode_frame: first bytes (hex) = {:?}", &data[..data.len().min(64)]);
+    }
     buf.freeze()
 }
 
@@ -384,6 +388,7 @@ async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> std::io::Result<by
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e))?;
     let len = u32::from_be_bytes(len_buf) as usize;
+    log::info!("read_frame: first 4 bytes (hex) = {:02X?}, len = {} (0x{:X})", len_buf, len, len);
     if len > 16 * 1024 * 1024 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
