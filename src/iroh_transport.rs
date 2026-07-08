@@ -130,12 +130,57 @@ impl IrohEndpoint {
 }
 
 /// Get or create the global Iroh endpoint.
+///
+/// The Iroh `Endpoint` spawns internal QUIC tasks (packet I/O, ACK,
+/// retransmission) on the current tokio runtime via `tokio::spawn`. If the
+/// caller is on a `current_thread` (single-threaded) runtime — which is what
+/// `io_loop` uses — those tasks starve: the single thread is busy in
+/// `stream.next()` and never yields to the endpoint tasks, so QUIC stalls and
+/// the peer resets the connection after ~1s.
+///
+/// Fix: create the endpoint on a dedicated multi-threaded runtime running on
+/// its own OS thread. Quinn's `Endpoint`, `Connection`, and stream handles are
+/// `Send + Sync` and communicate with the endpoint's tasks via internal
+/// channels, so they can be used from any runtime after creation. The
+/// dedicated thread stays alive forever to keep driving the endpoint tasks.
 pub async fn get_or_create_endpoint() -> ResultType<Arc<IrohEndpoint>> {
     let mut guard = IROH_ENDPOINT.lock().await;
     if let Some(ep) = guard.as_ref() {
         return Ok(ep.clone());
     }
-    let ep = IrohEndpoint::new().await?;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<ResultType<Arc<IrohEndpoint>>>();
+    std::thread::Builder::new()
+        .name("iroh-endpoint".to_owned())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(2)
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(Err(anyhow::anyhow!(
+                        "failed to create iroh runtime: {}",
+                        e
+                    )));
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let ep = IrohEndpoint::new().await;
+                let _ = tx.send(ep);
+                // Keep the runtime alive forever — the endpoint's background
+                // tasks (UDP I/O, QUIC state machine) live on this runtime.
+                std::future::pending::<()>().await;
+            });
+        })
+        .map_err(|e| anyhow::anyhow!("failed to spawn iroh-endpoint thread: {}", e))?;
+
+    let ep = rx
+        .await
+        .map_err(|e| anyhow::anyhow!("iroh endpoint thread died: {}", e))??;
+
     *guard = Some(ep.clone());
     Ok(ep)
 }
