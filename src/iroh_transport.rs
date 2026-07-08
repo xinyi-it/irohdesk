@@ -429,33 +429,80 @@ fn encode_frame(data: &[u8]) -> bytes::Bytes {
     let mut buf = BytesMut::with_capacity(4 + data.len());
     buf.put_u32(data.len() as u32);
     buf.extend_from_slice(data);
-    log::info!("encode_frame: payload size = {}, total frame size = {}", data.len(), 4 + data.len());
-    if data.len() > 0 && data.len() < 200 {
-        log::info!("encode_frame: first bytes (hex) = {:?}", &data[..data.len().min(64)]);
+    if data.len() > 64 * 1024 * 1024 {
+        // Only warn on unusually large frames (should be rare)
+        log::warn!("encode_frame: large payload size = {}", data.len());
     }
     buf.freeze()
 }
 
 /// Read a length-prefixed frame from a QUIC receive stream.
+///
+/// If an invalid length is encountered (too large, zero, or clearly not a
+/// frame header), attempts frame-sync recovery by scanning forward for the
+/// next plausible 4-byte BE length prefix before giving up.  This handles
+/// edge cases where QUIC stream data can become misaligned (e.g. partial
+/// reads during stream reset or large video payloads).
 async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> std::io::Result<bytes::BytesMut> {
     use tokio::io::AsyncReadExt;
+    const MAX_FRAME: usize = 64 * 1024 * 1024; // 64 MiB — enough for 4K video frames
+
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e))?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    log::info!("read_frame: first 4 bytes (hex) = {:02X?}, len = {} (0x{:X})", len_buf, len, len);
-    if len > 16 * 1024 * 1024 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("frame too large: {}", len),
-        ));
+
+    // Plausible frame?
+    if len > 0 && len <= MAX_FRAME {
+        let mut data = vec![0u8; len];
+        recv.read_exact(&mut data)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e))?;
+        return Ok(bytes::BytesMut::from(&data[..]));
     }
-    let mut data = vec![0u8; len];
-    recv.read_exact(&mut data)
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e))?;
-    Ok(bytes::BytesMut::from(&data[..]))
+
+    // Invalid length — attempt sync recovery by sliding a window looking for
+    // a plausible next frame header (small non-zero length ≤ MAX_FRAME).
+    log::warn!(
+        "read_frame: invalid length {} (0x{:X}), attempting frame sync recovery",
+        len,
+        len
+    );
+    const SCAN_BUF: usize = 4096;
+    let mut buf = [0u8; SCAN_BUF];
+    let mut scanned = 0usize;
+    let max_scan = MAX_FRAME; // don't scan forever
+
+    while scanned < max_scan {
+        let n = std::cmp::min(SCAN_BUF, max_scan - scanned);
+        match recv.read(&mut buf[..n]).await {
+            Ok(Some(0)) | Ok(None) => break,           // EOF / stream finished
+            Ok(Some(read_n)) => {
+                let read_n = read_n as usize;
+                scanned += read_n;
+                // Search for a 4-byte sequence that looks like a valid length prefix.
+                for i in 0..read_n.saturating_sub(3) {
+                    let candidate = u32::from_be_bytes([buf[i], buf[i+1], buf[i+2], buf[i+3]]) as usize;
+                    if candidate > 0 && candidate <= MAX_FRAME {
+                        if i > 0 {
+                            log::warn!("read_frame: sync recovered after discarding {} bytes", scanned - read_n + i);
+                        }
+                        let mut data = vec![0u8; candidate];
+                        if recv.read_exact(&mut data).await.is_ok() {
+                            return Ok(bytes::BytesMut::from(&data[..]));
+                        }
+                    }
+                }
+            }
+            Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("frame too large / desync (len={}, scanned={} bytes without recovery)", len, scanned),
+    ))
 }
 
 impl hbb_common::stream::IrohStreamTrait for IrohStream {
