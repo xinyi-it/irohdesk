@@ -483,7 +483,7 @@ async fn read_frame(
     // Largest single message we accept. The variable-length header can encode up
     // to `0x3FFFFFFF` (~1 GiB); 4K video keyframes can be tens of MiB, so we stay
     // well above realistic sizes but below the encode ceiling to reject garbage.
-    const MAX_PACKET_LENGTH: usize = 256 * 1024 * 1024; // 256 MiB
+    const MAX_PACKET_LENGTH: usize = 0x3FFFFFFF; // ~1 GiB — encode ceiling; reject only garbage headers
 
     if raw {
         // Frameless: return whatever the peer sent in this chunk. `Ok(0)` /
