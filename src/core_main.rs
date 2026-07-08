@@ -36,8 +36,40 @@ pub fn core_main() -> Option<Vec<String>> {
             std::process::exit(1);
         }
         match crate::iroh_transport::get_iroh_node_id() {
-            Ok(id) => { println!("{}", id); std::process::exit(0); }
+            Ok(id) => {
+                println!("{}", id);
+                // get_key_pair() persists a freshly generated key pair on a detached
+                // thread; std::process::exit would kill it before the file write lands,
+                // so the ID would change on every run. Give the flush a moment to finish.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::process::exit(0);
+            }
             Err(e) => { eprintln!("Error: {}", e); std::process::exit(1); }
+        }
+    }
+    // Set the permanent password used to authenticate incoming Iroh connections.
+    // Usage: --set-password <new-password>
+    if let Some(pos) = cli_args.iter().position(|a| a == "--set-password") {
+        if !crate::common::global_init() {
+            std::process::exit(1);
+        }
+        let pw = cli_args.get(pos + 1).cloned().unwrap_or_default();
+        if pw.is_empty() {
+            eprintln!("Error: password is empty");
+            std::process::exit(1);
+        }
+        match hbb_common::config::Config::set_permanent_password(&pw) {
+            true => {
+                println!("Permanent password updated.");
+                // set_permanent_password persists via Config::store() synchronously here,
+                // but mirror the --get-iroh-id flush guard for safety.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::process::exit(0);
+            }
+            false => {
+                eprintln!("Error: failed to set password (changing it may be disabled)");
+                std::process::exit(1);
+            }
         }
     }
     if let Some(pos) = cli_args.iter().position(|a| a == "--iroh-connect") {

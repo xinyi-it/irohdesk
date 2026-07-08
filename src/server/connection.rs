@@ -2587,9 +2587,14 @@ impl Connection {
                 }
             }
 
+            // Iroh P2P path: the client uses our Iroh NodeId (64-char hex public key)
+            // as lr.username instead of our numeric hbbs id. Accept either identity.
+            let own_iroh_id =
+                crate::iroh_transport::get_iroh_node_id().unwrap_or_default();
             if !hbb_common::is_ip_str(&lr.username)
                 && !hbb_common::is_domain_port_str(&lr.username)
                 && lr.username != Config::get_id()
+                && lr.username != own_iroh_id
             {
                 self.send_login_error(crate::client::LOGIN_MSG_OFFLINE)
                     .await;

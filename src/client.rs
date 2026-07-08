@@ -403,11 +403,14 @@ impl Client {
         // Connect via Iroh — this returns a QUIC connection
         let conn = iroh_transport::connect(peer).await?;
 
-        // Open a bidirectional QUIC stream for RustDesk protocol messages
+        // Accept the bidirectional QUIC stream opened by the server. The server
+        // speaks first in the RustDesk handshake (sends SignedId) via open_bi(),
+        // so the client accepts here — mirroring the CLI path. If the client
+        // open_bi()'d too, both sides would open with no one accepting, deadlocking.
         let (send_stream, recv_stream) = conn
-            .open_bi()
+            .accept_bi()
             .await
-            .map_err(|e| hbb_common::anyhow::anyhow!("failed to open QUIC bi-stream: {}", e))?;
+            .map_err(|e| hbb_common::anyhow::anyhow!("failed to accept QUIC bi-stream: {}", e))?;
 
         // Get the remote public key for secure connection verification
         // In iroh 0.35, Connection::remote_node_id() returns Result<NodeId>

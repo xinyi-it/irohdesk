@@ -631,9 +631,51 @@ pub async fn iroh_connect_and_handshake(
     let my_name = crate::username();
     let my_platform = hbb_common::whoami::platform().to_string();
 
+    // The server sends a Hash { salt, challenge } message right after the key
+    // exchange (on_open). We must hash the password with salt → h1, then h1 with
+    // challenge → h2, and send h2 as lr.password — the server never sees plaintext.
+    // If we don't receive a Hash in time (e.g. older server), fall back to plaintext
+    // so the connection still has a chance instead of hanging.
+    let password_field: bytes::Bytes = {
+        let pw_bytes = password.as_bytes().to_vec();
+        match hbb_common::timeout(10_000, stream.next()).await {
+            Ok(Some(Ok(b))) => {
+                match hbb_common::protos::message::Message::parse_from_bytes(&b) {
+                    Ok(msg) if matches!(msg.union, Some(hbb_common::message_proto::message::Union::Hash(_))) => {
+                        if let Some(hbb_common::message_proto::message::Union::Hash(hash)) = msg.union {
+                            use sha2::{Digest, Sha256};
+                            let mut h1 = Sha256::new();
+                            h1.update(&pw_bytes);
+                            h1.update(hash.salt.as_bytes());
+                            let h1 = h1.finalize();
+                            let mut h2 = Sha256::new();
+                            h2.update(&h1);
+                            h2.update(hash.challenge.as_bytes());
+                            h2.finalize().to_vec().into()
+                        } else {
+                            pw_bytes.into()
+                        }
+                    }
+                    Ok(_) => {
+                        log::warn!("Expected Hash message before login, got something else; sending plaintext password");
+                        pw_bytes.into()
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to parse pre-login message: {}; sending plaintext password", e);
+                        pw_bytes.into()
+                    }
+                }
+            }
+            _ => {
+                log::warn!("No Hash message received before login (timeout/closed); sending plaintext password");
+                pw_bytes.into()
+            }
+        }
+    };
+
     let mut lr = hbb_common::protos::message::LoginRequest::new();
     lr.username = peer_node_id.to_owned(); // Use peer's NodeId as the "ID" for login
-    lr.password = password.as_bytes().to_vec().into();
+    lr.password = password_field;
     lr.my_id = my_id;
     lr.my_name = my_name;
     lr.my_platform = my_platform;
@@ -647,6 +689,10 @@ pub async fn iroh_connect_and_handshake(
 
     // 5. Read server responses
     log::info!("Waiting for server response...");
+    let mut logged_in = false;
+    let mut frame_count: u64 = 0;
+    let mut audio_count: u64 = 0;
+    let mut last_stats = std::time::Instant::now();
     loop {
         match hbb_common::timeout(30_000, stream.next()).await {
             Ok(Some(Ok(bytes))) => {
@@ -654,15 +700,17 @@ pub async fn iroh_connect_and_handshake(
                     match msg.union {
                         Some(hbb_common::message_proto::message::Union::LoginResponse(lr)) => {
                             if lr.error().is_empty() {
+                                logged_in = true;
                                 log::info!("Login successful! Connected to desktop.");
                                 log::info!("  Platform: {}", lr.peer_info().platform);
+                                log::info!("Streaming... press Ctrl+C to disconnect.");
                             } else {
                                 log::error!("Login failed: {}", lr.error());
                                 return Err(anyhow::anyhow!("Login failed: {}", lr.error()));
                             }
                         }
                         Some(hbb_common::message_proto::message::Union::VideoFrame(_)) => {
-                            log::info!("Received video frame (desktop streaming active)");
+                            frame_count += 1;
                         }
                         Some(hbb_common::message_proto::message::Union::CursorData(_)) => {
                             // Cursor data — silently handle
@@ -671,7 +719,7 @@ pub async fn iroh_connect_and_handshake(
                             // Clipboard data
                         }
                         Some(hbb_common::message_proto::message::Union::AudioFrame(_)) => {
-                            log::info!("Received audio frame");
+                            audio_count += 1;
                         }
                         Some(other) => {
                             log::debug!("Received message: {:?}", std::mem::discriminant(&other));
@@ -680,6 +728,15 @@ pub async fn iroh_connect_and_handshake(
                             log::debug!("Received empty message");
                         }
                     }
+                }
+                // Periodic stats so the user can see the connection is alive and
+                // whether frames are actually flowing. Every 5s.
+                if logged_in && last_stats.elapsed() >= std::time::Duration::from_secs(5) {
+                    log::info!(
+                        "streaming: video frames={}, audio frames={}",
+                        frame_count, audio_count
+                    );
+                    last_stats = std::time::Instant::now();
                 }
             }
             Ok(Some(Err(e))) => {
@@ -691,8 +748,13 @@ pub async fn iroh_connect_and_handshake(
                 break;
             }
             Err(_) => {
-                log::info!("Read timeout (30s no data), connection may be idle");
-                break;
+                // Timeout without data. Do NOT break — keep waiting so the
+                // connection stays up. Only warn (less noisily after the first).
+                if logged_in {
+                    log::warn!("no data in 30s (video frames so far: {})", frame_count);
+                } else {
+                    log::info!("Waiting for server response...");
+                }
             }
         }
     }
