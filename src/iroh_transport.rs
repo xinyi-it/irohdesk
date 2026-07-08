@@ -381,6 +381,10 @@ pub struct IrohStream {
     /// length-prefix framing, causing the "frame too large" desync.
     send: Option<tokio::sync::Mutex<iroh::endpoint::SendStream>>,
     recv: Option<iroh::endpoint::RecvStream>,
+    /// When true (after `set_raw`), the stream carries frameless bytes:
+    /// `box_send_*` forwards payloads without a length header and `read_frame`
+    /// returns whatever is available. Used by port forwarding / raw payloads.
+    raw: bool,
     remote_node_id: String,
     // Encryption state (compatible with RustDesk's symmetric encryption)
     key: Option<sodiumoxide::crypto::secretbox::Key>,
@@ -400,6 +404,7 @@ impl IrohStream {
             conn,
             send: None,
             recv: None,
+            raw: false,
             remote_node_id,
             key: None,
             send_nonce: 0,
@@ -418,6 +423,7 @@ impl IrohStream {
             conn,
             send: Some(tokio::sync::Mutex::new(send)),
             recv: Some(recv),
+            raw: false,
             remote_node_id,
             key: None,
             send_nonce: 0,
@@ -426,87 +432,110 @@ impl IrohStream {
     }
 }
 
-/// Length-prefix framing: 4 bytes big-endian length + payload
-/// This matches RustDesk's BytesCodec framing.
+/// Frame data for the wire using RustDesk's `BytesCodec` variable-length header.
+///
+/// Header layout (must match `libs/hbb_common/src/bytes_codec.rs` exactly so this
+/// transport is wire-compatible with the TCP/WebSocket paths):
+///   - the first byte's low 2 bits encode `(header_len - 1)`, so header_len ∈ {1,2,3,4}
+///   - the length itself is stored in the remaining bits, little-endian, shifted
+///     left by 2 (`len << 2`), reserving the 2 low bits of the first byte for the tag.
 fn encode_frame(data: &[u8]) -> bytes::Bytes {
     use bytes::{BufMut, BytesMut};
-    let mut buf = BytesMut::with_capacity(4 + data.len());
-    buf.put_u32(data.len() as u32);
-    buf.extend_from_slice(data);
-    if data.len() > 64 * 1024 * 1024 {
-        // Only warn on unusually large frames (should be rare)
-        log::warn!("encode_frame: large payload size = {}", data.len());
+    let len = data.len();
+    let mut buf = BytesMut::with_capacity(len + 4);
+    if len <= 0x3F {
+        buf.put_u8((len << 2) as u8);
+    } else if len <= 0x3FFF {
+        buf.put_u16_le(((len << 2) as u16) | 0x1);
+    } else if len <= 0x3FFFFF {
+        let h = ((len << 2) as u32) | 0x2;
+        buf.put_u16_le((h & 0xFFFF) as u16);
+        buf.put_u8((h >> 16) as u8);
+    } else if len <= 0x3FFFFFFF {
+        buf.put_u32_le(((len << 2) as u32) | 0x3);
+    } else {
+        // Frames larger than ~1 GiB cannot be represented by the 30-bit length.
+        // This should never happen for RustDesk messages (incl. 4K video frames).
+        log::error!("encode_frame: payload too large to frame: {} bytes", len);
+        return buf.freeze();
     }
+    buf.extend_from_slice(data);
     buf.freeze()
 }
 
-/// Read a length-prefixed frame from a QUIC receive stream.
+/// Read a single message from a QUIC receive stream.
 ///
-/// If an invalid length is encountered (too large, zero, or clearly not a
-/// frame header), attempts frame-sync recovery by scanning forward for the
-/// next plausible 4-byte BE length prefix before giving up.  This handles
-/// edge cases where QUIC stream data can become misaligned (e.g. partial
-/// reads during stream reset or large video payloads).
-async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> std::io::Result<bytes::BytesMut> {
+/// When `raw` is true the stream carries frameless bytes (enabled via `set_raw`,
+/// used by port forwarding / raw payloads): we return whatever is currently
+/// available. Otherwise we decode RustDesk's `BytesCodec` variable-length header
+/// and read exactly that many payload bytes.
+///
+/// Unlike the previous implementation this does NOT attempt "frame sync recovery"
+/// by scanning forward for a plausible header: that silently discarded real data
+/// and produced the mosaic / blocky picture. On an invalid header we error out so
+/// any remaining framing bug surfaces cleanly instead of corrupting the stream.
+async fn read_frame(
+    recv: &mut iroh::endpoint::RecvStream,
+    raw: bool,
+) -> std::io::Result<bytes::BytesMut> {
     use tokio::io::AsyncReadExt;
-    const MAX_FRAME: usize = 64 * 1024 * 1024; // 64 MiB — enough for 4K video frames
 
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf)
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e))?;
-    let len = u32::from_be_bytes(len_buf) as usize;
+    // Largest single message we accept. The variable-length header can encode up
+    // to `0x3FFFFFFF` (~1 GiB); 4K video keyframes can be tens of MiB, so we stay
+    // well above realistic sizes but below the encode ceiling to reject garbage.
+    const MAX_PACKET_LENGTH: usize = 256 * 1024 * 1024; // 256 MiB
 
-    // Plausible frame?
-    if len > 0 && len <= MAX_FRAME {
-        let mut data = vec![0u8; len];
+    if raw {
+        // Frameless: return whatever the peer sent in this chunk. `Ok(0)` /
+        // `None` from iroh's `read` signals the stream finished (EOF).
+        let mut buf = [0u8; 65536];
+        match recv.read(&mut buf).await {
+            Ok(Some(0)) | Ok(None) => Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "raw stream closed",
+            )),
+            Ok(Some(n)) => Ok(bytes::BytesMut::from(&buf[..n])),
+            Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+        }
+    } else {
+        // Decode the variable-length header. The first byte's low 2 bits give
+        // (header_len - 1); the length lives in the remaining bits, little-endian,
+        // shifted left by 2 (mirrors `BytesCodec::decode_head`).
+        let mut first = [0u8; 1];
+        recv.read_exact(&mut first)
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e))?;
+        let head_len = ((first[0] & 0x3) + 1) as usize;
+        let mut head = [0u8; 4];
+        head[0] = first[0];
+        if head_len > 1 {
+            recv.read_exact(&mut head[1..head_len])
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e))?;
+        }
+        let mut n = head[0] as usize;
+        if head_len > 1 {
+            n |= (head[1] as usize) << 8;
+        }
+        if head_len > 2 {
+            n |= (head[2] as usize) << 16;
+        }
+        if head_len > 3 {
+            n |= (head[3] as usize) << 24;
+        }
+        n >>= 2;
+        if n > MAX_PACKET_LENGTH {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("frame too large: {} bytes (max {})", n, MAX_PACKET_LENGTH),
+            ));
+        }
+        let mut data = vec![0u8; n];
         recv.read_exact(&mut data)
             .await
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e))?;
-        return Ok(bytes::BytesMut::from(&data[..]));
+        Ok(bytes::BytesMut::from(&data[..]))
     }
-
-    // Invalid length — attempt sync recovery by sliding a window looking for
-    // a plausible next frame header (small non-zero length ≤ MAX_FRAME).
-    log::warn!(
-        "read_frame: invalid length {} (0x{:X}), attempting frame sync recovery",
-        len,
-        len
-    );
-    const SCAN_BUF: usize = 4096;
-    let mut buf = [0u8; SCAN_BUF];
-    let mut scanned = 0usize;
-    let max_scan = MAX_FRAME; // don't scan forever
-
-    while scanned < max_scan {
-        let n = std::cmp::min(SCAN_BUF, max_scan - scanned);
-        match recv.read(&mut buf[..n]).await {
-            Ok(Some(0)) | Ok(None) => break,           // EOF / stream finished
-            Ok(Some(read_n)) => {
-                let read_n = read_n as usize;
-                scanned += read_n;
-                // Search for a 4-byte sequence that looks like a valid length prefix.
-                for i in 0..read_n.saturating_sub(3) {
-                    let candidate = u32::from_be_bytes([buf[i], buf[i+1], buf[i+2], buf[i+3]]) as usize;
-                    if candidate > 0 && candidate <= MAX_FRAME {
-                        if i > 0 {
-                            log::warn!("read_frame: sync recovered after discarding {} bytes", scanned - read_n + i);
-                        }
-                        let mut data = vec![0u8; candidate];
-                        if recv.read_exact(&mut data).await.is_ok() {
-                            return Ok(bytes::BytesMut::from(&data[..]));
-                        }
-                    }
-                }
-            }
-            Err(e) => return Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
-        }
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        format!("frame too large / desync (len={}, scanned={} bytes without recovery)", len, scanned),
-    ))
 }
 
 impl hbb_common::stream::IrohStreamTrait for IrohStream {
@@ -515,7 +544,8 @@ impl hbb_common::stream::IrohStreamTrait for IrohStream {
     }
 
     fn set_raw(&mut self) {
-        // No-op — QUIC streams are always framed
+        self.raw = true;
+        log::debug!("IrohStream switched to raw (frameless) mode");
     }
 
     fn set_key(&mut self, key: sodiumoxide::crypto::secretbox::Key) {
@@ -549,11 +579,14 @@ impl hbb_common::stream::IrohStreamTrait for IrohStream {
         bytes: bytes::Bytes,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ResultType<()>> + Send + '_>> {
         Box::pin(async move {
+            let raw = self.raw;
             let send_mutex = self
                 .send
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("no send stream available"))?;
-            let framed = encode_frame(&bytes);
+            // In raw mode (set via set_raw) forward the bytes without a length
+            // header; otherwise frame them with RustDesk's BytesCodec header.
+            let framed: bytes::Bytes = if raw { bytes } else { encode_frame(&bytes) };
             // Serialize writes so concurrent callers (video + control) don't
             // interleave their framed output on the same QUIC stream.
             let mut send = send_mutex.lock().await;
@@ -569,11 +602,16 @@ impl hbb_common::stream::IrohStreamTrait for IrohStream {
         bytes: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ResultType<()>> + Send + '_>> {
         Box::pin(async move {
+            let raw = self.raw;
             let send_mutex = self
                 .send
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("no send stream available"))?;
-            let framed = encode_frame(&bytes);
+            let framed: bytes::Bytes = if raw {
+                bytes::Bytes::from(bytes)
+            } else {
+                encode_frame(&bytes)
+            };
             let mut send = send_mutex.lock().await;
             send.write_all(&framed)
                 .await
@@ -588,6 +626,7 @@ impl hbb_common::stream::IrohStreamTrait for IrohStream {
         Box<dyn std::future::Future<Output = Option<Result<bytes::BytesMut, std::io::Error>>> + Send + '_>,
     > {
         Box::pin(async move {
+            let raw = self.raw;
             let recv = match self.recv.as_mut() {
                 Some(r) => r,
                 None => return Some(Err(std::io::Error::new(
@@ -595,7 +634,7 @@ impl hbb_common::stream::IrohStreamTrait for IrohStream {
                     "no receive stream available",
                 ))),
             };
-            match read_frame(recv).await {
+            match read_frame(recv, raw).await {
                 Ok(data) => Some(Ok(data)),
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -615,6 +654,7 @@ impl hbb_common::stream::IrohStreamTrait for IrohStream {
         Box<dyn std::future::Future<Output = Option<Result<bytes::BytesMut, std::io::Error>>> + Send + '_>,
     > {
         Box::pin(async move {
+            let raw = self.raw;
             let recv = match self.recv.as_mut() {
                 Some(r) => r,
                 None => return Some(Err(std::io::Error::new(
@@ -622,7 +662,7 @@ impl hbb_common::stream::IrohStreamTrait for IrohStream {
                     "no receive stream available",
                 ))),
             };
-            match hbb_common::timeout(timeout_ms, read_frame(recv)).await {
+            match hbb_common::timeout(timeout_ms, read_frame(recv, raw)).await {
                 Ok(result) => match result {
                     Ok(data) => Some(Ok(data)),
                     Err(e) => {
