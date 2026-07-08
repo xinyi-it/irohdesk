@@ -400,33 +400,81 @@ impl Client {
         interface.update_direct(Some(true));
         interface.update_received(true);
 
-        // Connect via Iroh — this returns a QUIC connection
+        // The Iroh endpoint is created on a dedicated OS thread with its own
+        // multi-threaded runtime (see get_or_create_endpoint). Quinn's
+        // Connection/Stream are Send+Sync, so we can safely await them here
+        // on io_loop's current_thread runtime.
         let conn = iroh_transport::connect(peer).await?;
 
-        // Accept the bidirectional QUIC stream opened by the server. The server
-        // speaks first in the RustDesk handshake (sends SignedId) via open_bi(),
-        // so the client accepts here — mirroring the CLI path. If the client
-        // open_bi()'d too, both sides would open with no one accepting, deadlocking.
         let (send_stream, recv_stream) = conn
             .accept_bi()
             .await
             .map_err(|e| hbb_common::anyhow::anyhow!("failed to accept QUIC bi-stream: {}", e))?;
 
-        // Get the remote public key for secure connection verification
-        // In iroh 0.35, Connection::remote_node_id() returns Result<NodeId>
         let remote_pk = conn
             .remote_node_id()
             .ok()
             .map(|id| id.as_bytes().to_vec());
 
-        // Wrap the QUIC stream as a RustDesk Stream using IrohStream adapter
         let iroh_stream = iroh_transport::IrohStream::from_bi(
             send_stream,
             recv_stream,
             conn,
             peer.to_owned(),
         );
-        let stream = Stream::from_iroh(iroh_stream, peer.to_owned());
+        let mut stream = Stream::from_iroh(iroh_stream, peer.to_owned());
+
+        // RustDesk handshake: receive SignedId, exchange keys, set up encryption.
+        use hbb_common::{config::Config, sodiumoxide::crypto::sign, protobuf::Message as _};
+        let (sk, pk) = Config::get_key_pair();
+        if pk.len() == sign::PUBLICKEYBYTES && sk.len() == sign::SECRETKEYBYTES {
+            let sign_pk = sign::PublicKey(
+                pk[..sign::PUBLICKEYBYTES].try_into().unwrap_or([0u8; 32])
+            );
+
+            log::info!("Iroh: waiting for server's SignedId...");
+            let msg_bytes = hbb_common::timeout(15_000, stream.next())
+                .await
+                .map_err(|_| hbb_common::anyhow::anyhow!("timeout waiting for SignedId"))?
+                .ok_or_else(|| hbb_common::anyhow::anyhow!("connection closed before SignedId"))?
+                .map_err(|e| hbb_common::anyhow::anyhow!("read error: {}", e))?;
+
+            let msg_in = hbb_common::protos::message::Message::parse_from_bytes(&msg_bytes)
+                .map_err(|e| hbb_common::anyhow::anyhow!("failed to parse SignedId: {}", e))?;
+
+            if let Some(hbb_common::message_proto::message::Union::SignedId(si)) = msg_in.union {
+                if let Ok((_server_id, their_pk_b)) =
+                    crate::common::decode_id_pk(&si.id, &sign_pk)
+                {
+                    let (asymmetric_value, symmetric_value, key) =
+                        crate::common::create_symmetric_key_msg(their_pk_b);
+                    let mut msg_out = hbb_common::protos::message::Message::new();
+                    msg_out.set_public_key(hbb_common::protos::message::PublicKey {
+                        asymmetric_value,
+                        symmetric_value,
+                        ..Default::default()
+                    });
+                    hbb_common::timeout(10_000, stream.send(&msg_out)).await??;
+                    stream.set_key(key);
+                    log::info!("Iroh: encrypted channel established");
+                } else {
+                    log::warn!("Iroh: failed to verify server identity, proceeding unencrypted");
+                    let mut msg_out = hbb_common::protos::message::Message::new();
+                    msg_out.set_public_key(hbb_common::protos::message::PublicKey::new());
+                    stream.send(&msg_out).await?;
+                }
+            } else {
+                log::warn!("Iroh: expected SignedId, got something else. Proceeding unencrypted.");
+                let mut msg_out = hbb_common::protos::message::Message::new();
+                msg_out.set_public_key(hbb_common::protos::message::PublicKey::new());
+                stream.send(&msg_out).await?;
+            }
+        } else {
+            log::warn!("Iroh: no valid key pair, sending empty handshake");
+            let mut msg_out = hbb_common::protos::message::Message::new();
+            msg_out.set_public_key(hbb_common::protos::message::PublicKey::new());
+            stream.send(&msg_out).await?;
+        }
 
         log::info!("Iroh P2P connection established to {}", peer);
 

@@ -579,11 +579,11 @@ pub async fn iroh_connect_and_handshake(
         protobuf::Message as _,
     };
 
-    log::info!("Connecting to peer via Iroh P2P: {}", peer_node_id);
+    eprintln!("Connecting to peer via Iroh P2P: {}", peer_node_id);
 
     // 1. Connect via Iroh
     let conn = connect(peer_node_id).await?;
-    log::info!("Iroh connection established");
+    eprintln!("Iroh connection established");
 
     // 2. Accept the bi-stream opened by the server. The server opens the
     // stream because it speaks first (sends SignedId); accepting here
@@ -599,7 +599,7 @@ pub async fn iroh_connect_and_handshake(
         .remote_node_id()
         .map(|id| id.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
-    log::info!("Remote NodeId: {}", remote_node_id);
+    eprintln!("Remote NodeId: {}", remote_node_id);
 
     // Wrap as RustDesk Stream
     let iroh_stream = IrohStream::from_bi(
@@ -618,7 +618,7 @@ pub async fn iroh_connect_and_handshake(
         let sign_sk = sign::SecretKey(sk_);
 
         // Receive server's SignedId
-        log::info!("Waiting for server's SignedId...");
+        eprintln!("Waiting for server's SignedId...");
         let msg_bytes = hbb_common::timeout(15_000, stream.next())
             .await
             .map_err(|_| anyhow::anyhow!("timeout waiting for SignedId"))?
@@ -636,7 +636,7 @@ pub async fn iroh_connect_and_handshake(
             if let Ok((server_id, their_pk_b)) =
                 crate::common::decode_id_pk(&si.id, &sign_pk)
             {
-                log::info!("Server ID: {}, verified", server_id);
+                eprintln!("Server ID: {}, verified", server_id);
 
                 // Generate our box_ keypair and create symmetric key
                 let (asymmetric_value, symmetric_value, key) =
@@ -652,21 +652,21 @@ pub async fn iroh_connect_and_handshake(
                 hbb_common::timeout(10_000, stream.send(&msg_out))
                     .await??;
                 stream.set_key(key);
-                log::info!("Encrypted channel established");
+                eprintln!("Encrypted channel established");
             } else {
-                log::warn!("Failed to verify server identity, proceeding unencrypted");
+                eprintln!("Failed to verify server identity, proceeding unencrypted");
                 let mut msg_out = hbb_common::protos::message::Message::new();
                 msg_out.set_public_key(hbb_common::protos::message::PublicKey::new());
                 stream.send(&msg_out).await?;
             }
         } else {
-            log::warn!("Expected SignedId, got something else. Proceeding unencrypted.");
+            eprintln!("Expected SignedId, got something else. Proceeding unencrypted.");
             let mut msg_out = hbb_common::protos::message::Message::new();
             msg_out.set_public_key(hbb_common::protos::message::PublicKey::new());
             stream.send(&msg_out).await?;
         }
     } else {
-        log::warn!("No valid key pair, sending empty handshake");
+        eprintln!("No valid key pair, sending empty handshake");
         let mut msg_out = hbb_common::protos::message::Message::new();
         msg_out.set_public_key(hbb_common::protos::message::PublicKey::new());
         stream.send(&msg_out).await?;
@@ -703,17 +703,17 @@ pub async fn iroh_connect_and_handshake(
                         }
                     }
                     Ok(_) => {
-                        log::warn!("Expected Hash message before login, got something else; sending plaintext password");
+                        eprintln!("Expected Hash message before login, got something else; sending plaintext password");
                         pw_bytes.into()
                     }
                     Err(e) => {
-                        log::warn!("Failed to parse pre-login message: {}; sending plaintext password", e);
+                        eprintln!("Failed to parse pre-login message: {}; sending plaintext password", e);
                         pw_bytes.into()
                     }
                 }
             }
             _ => {
-                log::warn!("No Hash message received before login (timeout/closed); sending plaintext password");
+                eprintln!("No Hash message received before login (timeout/closed); sending plaintext password");
                 pw_bytes.into()
             }
         }
@@ -729,12 +729,12 @@ pub async fn iroh_connect_and_handshake(
 
     let mut msg_out = hbb_common::protos::message::Message::new();
     msg_out.set_login_request(lr);
-    log::info!("Sending login request with password...");
+    eprintln!("Sending login request with password...");
     hbb_common::timeout(10_000, stream.send(&msg_out))
         .await??;
 
     // 5. Read server responses
-    log::info!("Waiting for server response...");
+    eprintln!("Waiting for server response...");
     let mut logged_in = false;
     let mut frame_count: u64 = 0;
     let mut audio_count: u64 = 0;
@@ -747,11 +747,11 @@ pub async fn iroh_connect_and_handshake(
                         Some(hbb_common::message_proto::message::Union::LoginResponse(lr)) => {
                             if lr.error().is_empty() {
                                 logged_in = true;
-                                log::info!("Login successful! Connected to desktop.");
-                                log::info!("  Platform: {}", lr.peer_info().platform);
-                                log::info!("Streaming... press Ctrl+C to disconnect.");
+                                eprintln!("Login successful! Connected to desktop.");
+                                eprintln!("  Platform: {}", lr.peer_info().platform);
+                                eprintln!("Streaming... press Ctrl+C to disconnect.");
                             } else {
-                                log::error!("Login failed: {}", lr.error());
+                                eprintln!("Login failed: {}", lr.error());
                                 return Err(anyhow::anyhow!("Login failed: {}", lr.error()));
                             }
                         }
@@ -768,17 +768,17 @@ pub async fn iroh_connect_and_handshake(
                             audio_count += 1;
                         }
                         Some(other) => {
-                            log::debug!("Received message: {:?}", std::mem::discriminant(&other));
+                            eprintln!("Received message: {:?}", std::mem::discriminant(&other));
                         }
                         None => {
-                            log::debug!("Received empty message");
+                            eprintln!("Received empty message");
                         }
                     }
                 }
                 // Periodic stats so the user can see the connection is alive and
                 // whether frames are actually flowing. Every 5s.
                 if logged_in && last_stats.elapsed() >= std::time::Duration::from_secs(5) {
-                    log::info!(
+                    eprintln!(
                         "streaming: video frames={}, audio frames={}",
                         frame_count, audio_count
                     );
@@ -786,20 +786,20 @@ pub async fn iroh_connect_and_handshake(
                 }
             }
             Ok(Some(Err(e))) => {
-                log::error!("Stream read error: {}", e);
+                eprintln!("Stream read error: {}", e);
                 break;
             }
             Ok(None) => {
-                log::info!("Connection closed by server");
+                eprintln!("Connection closed by server");
                 break;
             }
             Err(_) => {
                 // Timeout without data. Do NOT break — keep waiting so the
                 // connection stays up. Only warn (less noisily after the first).
                 if logged_in {
-                    log::warn!("no data in 30s (video frames so far: {})", frame_count);
+                    eprintln!("no data in 30s (video frames so far: {})", frame_count);
                 } else {
-                    log::info!("Waiting for server response...");
+                    eprintln!("Waiting for server response...");
                 }
             }
         }
