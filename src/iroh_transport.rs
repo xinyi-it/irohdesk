@@ -375,7 +375,11 @@ async fn handle_iroh_connection(
 /// of the raw stream — we replicate that framing here.
 pub struct IrohStream {
     conn: Connection,
-    send: Option<iroh::endpoint::SendStream>,
+    /// Send stream wrapped in a Mutex so concurrent `box_send_*` calls
+    /// (video service + control protocol) serialize their framed writes.
+    /// Without this, two `write_all` calls can interleave and corrupt the
+    /// length-prefix framing, causing the "frame too large" desync.
+    send: Option<tokio::sync::Mutex<iroh::endpoint::SendStream>>,
     recv: Option<iroh::endpoint::RecvStream>,
     remote_node_id: String,
     // Encryption state (compatible with RustDesk's symmetric encryption)
@@ -412,7 +416,7 @@ impl IrohStream {
     ) -> Self {
         Self {
             conn,
-            send: Some(send),
+            send: Some(tokio::sync::Mutex::new(send)),
             recv: Some(recv),
             remote_node_id,
             key: None,
@@ -545,11 +549,14 @@ impl hbb_common::stream::IrohStreamTrait for IrohStream {
         bytes: bytes::Bytes,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ResultType<()>> + Send + '_>> {
         Box::pin(async move {
-            let send = self
+            let send_mutex = self
                 .send
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("no send stream available"))?;
             let framed = encode_frame(&bytes);
+            // Serialize writes so concurrent callers (video + control) don't
+            // interleave their framed output on the same QUIC stream.
+            let mut send = send_mutex.lock().await;
             send.write_all(&framed)
                 .await
                 .map_err(|e| anyhow::anyhow!("QUIC write error: {}", e))?;
@@ -562,11 +569,12 @@ impl hbb_common::stream::IrohStreamTrait for IrohStream {
         bytes: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ResultType<()>> + Send + '_>> {
         Box::pin(async move {
-            let send = self
+            let send_mutex = self
                 .send
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("no send stream available"))?;
             let framed = encode_frame(&bytes);
+            let mut send = send_mutex.lock().await;
             send.write_all(&framed)
                 .await
                 .map_err(|e| anyhow::anyhow!("QUIC write error: {}", e))?;
