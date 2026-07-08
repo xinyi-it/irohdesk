@@ -27,9 +27,11 @@ use hbb_common::{
     ResultType,
 };
 
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
 use crate::server::{ConnectionMeta, ServerPtr};
-use iroh::{Endpoint, NodeId, SecretKey, PublicKey};
-use iroh::endpoint::Connection;
+use iroh::{Endpoint, NodeAddr, NodeId, RelayMap, RelayUrl, SecretKey, PublicKey};
+use iroh::endpoint::{Connection, RelayMode};
 
 /// ALPN protocol identifier for RustDesk over Iroh.
 pub const ALPN: &[u8] = b"rustdesk/iroh/1";
@@ -109,13 +111,51 @@ impl IrohEndpoint {
         let (sk_bytes, pk_bytes) = hbb_common::config::Config::get_key_pair();
         let secret = rustdesk_keypair_to_iroh_secret(&sk_bytes, &pk_bytes)?;
 
-        let endpoint = Endpoint::builder()
+        // Bind Iroh to a fixed UDP port so peer addresses are predictable and
+        // direct connections (e.g. over Tailscale) can be established without a
+        // relay. Override with IROH_BIND_PORT.
+        let bind_port: u16 = std::env::var("IROH_BIND_PORT")
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .unwrap_or(7788);
+        let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, bind_port);
+
+        let mut builder = Endpoint::builder()
             .secret_key(secret)
             .alpns(vec![ALPN.to_vec()])
-            .discovery_n0()
+            .bind_addr_v4(bind_addr);
+
+        // n0's public relay/DHT infrastructure is unreachable in some networks.
+        // Two escape hatches:
+        //  - IROH_RELAY_URL: point both peers at a self-hosted relay (also serves
+        //    discovery). Format: "http://host:port".
+        //  - IROH_PEER_ADDR: direct-connect to a known peer socket address (e.g.
+        //    over Tailscale), bypassing relay entirely. Format: "ip:port".
+        // When neither is set, fall back to n0 (works on open networks).
+        match (std::env::var("IROH_RELAY_URL"), std::env::var("IROH_PEER_ADDR")) {
+            (Ok(relay), _) if !relay.trim().is_empty() => {
+                let relay_url: RelayUrl = relay
+                    .trim()
+                    .parse()
+                    .map_err(|e| anyhow::anyhow!("invalid IROH_RELAY_URL '{}': {}", relay, e))?;
+                log::info!("Iroh endpoint using custom relay: {}", relay_url);
+                builder = builder.relay_mode(RelayMode::Custom(RelayMap::from(relay_url)));
+            }
+            (_, Ok(peer)) if !peer.trim().is_empty() => {
+                log::info!("Iroh endpoint in direct-connect mode (relay disabled)");
+                builder = builder.relay_mode(RelayMode::Disabled);
+            }
+            _ => {
+                log::info!("Iroh endpoint using default n0 discovery/relay");
+                builder = builder.discovery_n0();
+            }
+        }
+
+        let endpoint = builder
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!("failed to bind Iroh endpoint: {}", e))?;
+        log::info!("Iroh endpoint bound on UDP port {}", bind_port);
 
         let node_id = endpoint.node_id().to_string();
         log::info!("Iroh endpoint started, NodeId: {}", node_id);
@@ -196,6 +236,22 @@ pub async fn connect(peer_node_id: &str) -> ResultType<Connection> {
     let node_id: NodeId = peer_node_id
         .parse()
         .map_err(|e| anyhow::anyhow!("failed to parse Iroh NodeId '{}': {}", peer_node_id, e))?;
+
+    // If a direct peer socket address is configured (e.g. over Tailscale),
+    // inject it so Iroh can connect without a relay.
+    if let Ok(peer_addr) = std::env::var("IROH_PEER_ADDR") {
+        if let Ok(socket) = peer_addr.trim().parse::<SocketAddr>() {
+            let pk = PublicKey::from_bytes(node_id.as_bytes())
+                .map_err(|e| anyhow::anyhow!("invalid public key bytes: {}", e))?;
+            let node_addr = NodeAddr::new(pk).with_direct_addresses([socket]);
+            match ep.endpoint.add_node_addr(node_addr) {
+                Ok(()) => log::info!("injected direct peer addr {} for {}", socket, peer_node_id),
+                Err(e) => log::warn!("failed to inject peer addr {}: {}", socket, e),
+            }
+        } else {
+            log::warn!("invalid IROH_PEER_ADDR '{}', ignoring", peer_addr);
+        }
+    }
 
     log::info!("Connecting via Iroh to NodeId: {}", peer_node_id);
 
