@@ -495,6 +495,15 @@ impl Decoder {
                 _ => {}
             }
         }
+        #[cfg(target_os = "macos")]
+        {
+            // The libvpx VP9 decoder in this irohdesk macOS build fails to decode
+            // the very first frame (vpx_codec_decode returns VPX_CODEC_ERROR),
+            // producing a permanent black screen. Force VP8 so the server encodes
+            // VP8 instead — VP8 is encoded reliably by the server and decoded fine
+            // by libvpx, whereas VP9 is broken here.
+            decoding.prefer = PreferCodec::VP8.into();
+        }
         decoding
     }
 
